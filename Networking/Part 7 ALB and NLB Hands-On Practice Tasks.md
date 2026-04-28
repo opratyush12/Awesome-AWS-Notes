@@ -53,6 +53,245 @@ Both ALB and NLB route traffic to **Target Groups**. A Target Group is just a co
 
 ---
 
+### ALB Health Check Settings - Deep Dive
+
+When you create a Target Group for an ALB, you configure **health checks**. These are how the ALB decides if an instance is alive and ready to receive traffic. If an instance fails health checks, the ALB **stops sending traffic to it** — this is the core of automatic failover.
+
+Here's every health check field explained using our Todo app as an example:
+
+```
+Health Check Configuration (Target Group)
+══════════════════════════════════════════════════════════════════════════════
+
+  Health check protocol:    HTTP
+  Health check path:        /getTodos
+  Health check port:        traffic-port
+  Interval:                 30 seconds
+  Timeout:                  5 seconds
+  Healthy threshold:        5
+  Unhealthy threshold:      2
+  Success codes:            200
+
+══════════════════════════════════════════════════════════════════════════════
+```
+
+#### 1. Health Check Protocol: `HTTP`
+
+The protocol the ALB uses when pinging your instance. Since our app is a plain HTTP server (no HTTPS/SSL), we use `HTTP`. Options:
+
+| Protocol | When to Use |
+|----------|-------------|
+| **HTTP** | Your app serves plain HTTP (most common for backends behind ALB) |
+| **HTTPS** | Your app has its own SSL certificate and terminates TLS itself |
+
+> For ALB Target Groups, you'll almost always use HTTP here. The ALB itself handles HTTPS termination from the internet side — your backend EC2s typically talk plain HTTP to the ALB.
+
+#### 2. Health Check Path: `/getTodos`
+
+The **URL path** the ALB hits on your instance to check if it's healthy. The ALB sends a GET request to this path.
+
+```
+What the ALB does every health check cycle:
+──────────────────────────────────────────────────────────────────
+
+    ALB  ──── GET http://<instance-IP>:8080/getTodos ────>  EC2
+
+    EC2  ──── 200 OK + JSON response ────────────────────>  ALB
+
+    ALB thinks: "Got 200, this instance is healthy ✓"
+
+──────────────────────────────────────────────────────────────────
+```
+
+**Why `/getTodos` instead of `/home`?**
+- `/home` only proves the server process is running
+- `/getTodos` proves the server is running AND the todo data/logic is accessible
+- In real apps, you'd pick a path that tests a meaningful part of your application (e.g., a path that queries the database) so the health check catches more failure modes
+
+**Choosing a good health check path:**
+- Pick a path that's **lightweight** (doesn't do heavy computation or slow DB queries)
+- Pick a path that **exercises your critical dependencies** (DB connection, cache, etc.)
+- NEVER use a path that **modifies data** (no POST-like side effects from a GET)
+- NEVER use a path that **requires authentication** (the ALB sends a plain GET, no tokens)
+- Common patterns: `/health`, `/healthz`, `/status`, or a lightweight GET endpoint like `/getTodos`
+
+#### 3. Health Check Port: `traffic-port`
+
+Which port the ALB sends the health check request to.
+
+| Option | Meaning |
+|--------|---------|
+| **traffic-port** (default) | Use the same port that the Target Group is configured to receive traffic on |
+| **Override (custom port)** | Specify a different port number |
+
+With `traffic-port`: If your Target Group forwards traffic to port `8080`, the health check also hits port `8080`. This is what you want 99% of the time — you're checking the same port that serves real traffic.
+
+**When would you override?** If your app exposes a dedicated health endpoint on a separate port (e.g., main app on 8080 but health/metrics on 9090). This is uncommon for simple setups.
+
+#### 4. Interval: `30 seconds`
+
+How often the ALB sends a health check request to each target.
+
+```
+Timeline with 30-second interval:
+──────────────────────────────────────────────────────────────────
+
+ 0s       30s      60s      90s      120s     150s
+ │         │        │        │         │        │
+ ▼         ▼        ▼        ▼         ▼        ▼
+ PING     PING     PING     PING     PING     PING
+ 200✓     200✓     200✓     FAIL✗    FAIL✗    200✓
+                                       │
+                              Unhealthy threshold (2) reached!
+                              ALB stops sending traffic here
+
+──────────────────────────────────────────────────────────────────
+```
+
+- **30 seconds** is the default — ALB pings once every 30 seconds
+- **Lower interval** (e.g., 10s) = faster detection of failures, but more load on your instances
+- **Higher interval** (e.g., 60s) = less load, but slower to detect failures
+- For production: 30s is a good balance
+- For testing/labs: 10s so you don't wait forever to see health status changes
+
+> **Math**: If interval = 30s and unhealthy threshold = 2, it takes **minimum 60 seconds** (2 × 30s) to mark an instance unhealthy after it starts failing.
+
+#### 5. Timeout: `5 seconds`
+
+How long the ALB waits for a response before considering that single health check **failed**.
+
+```
+What happens on each health check ping:
+──────────────────────────────────────────────────────────────────
+
+  ALB sends GET /getTodos
+       │
+       ├── Response within 5s?  →  Check the status code (200 = pass)
+       │
+       └── No response in 5s?   →  This check is a FAIL ✗
+                                    (counts toward unhealthy threshold)
+
+──────────────────────────────────────────────────────────────────
+```
+
+- **Timeout must be LESS than interval** (5s timeout < 30s interval — otherwise the next ping starts before the current one finishes)
+- If your app is fast (like our Node.js Todo app), 5s is generous — it responds in milliseconds
+- If your health check path queries a database or external service, it might need more time
+- **Don't set timeout too low** (e.g., 1s) — network latency spikes could cause false failures
+
+#### 6. Healthy Threshold: `5`
+
+How many **consecutive successful** health checks an instance needs before the ALB considers it "healthy" and starts sending it traffic.
+
+```
+Instance recovering after being unhealthy (threshold = 5):
+──────────────────────────────────────────────────────────────────
+
+  Check 1:  200 ✓  (1/5 — not healthy yet)
+  Check 2:  200 ✓  (2/5 — not healthy yet)
+  Check 3:  200 ✓  (3/5 — not healthy yet)
+  Check 4:  200 ✓  (4/5 — not healthy yet)
+  Check 5:  200 ✓  (5/5 — NOW HEALTHY! ALB starts sending traffic)
+
+  With interval = 30s, this takes: 5 × 30s = 150 seconds (2.5 minutes)
+
+──────────────────────────────────────────────────────────────────
+```
+
+**Why set it to 5?**
+- **Higher threshold = more conservative**. The instance must prove it's consistently healthy, not just a one-off success. This prevents a flapping instance (up, down, up, down) from receiving traffic prematurely.
+- **Lower threshold** (e.g., 2) = faster recovery. Instance gets traffic sooner after coming back up.
+- **Trade-off**: Higher threshold is safer but means longer recovery time. In production with `healthy threshold = 5` and `interval = 30s`, a recovered instance waits 2.5 minutes before getting traffic.
+- For testing/labs: Use 2 so you're not waiting minutes for targets to become healthy
+
+#### 7. Unhealthy Threshold: `2`
+
+How many **consecutive failed** health checks before the ALB considers the instance "unhealthy" and **stops sending it traffic**.
+
+```
+Instance failing (threshold = 2):
+──────────────────────────────────────────────────────────────────
+
+  Check 1:  200 ✓   (healthy, normal)
+  Check 2:  200 ✓   (healthy, normal)
+  Check 3:  FAIL ✗  (1/2 failures — still healthy, could be a blip)
+  Check 4:  FAIL ✗  (2/2 failures — UNHEALTHY! ALB stops sending traffic)
+
+  With interval = 30s, detection takes: 2 × 30s = 60 seconds
+
+──────────────────────────────────────────────────────────────────
+```
+
+**Why set it to 2?**
+- **Lower threshold = faster failure detection**. As soon as 2 checks fail in a row, the instance is pulled from rotation. Users stop getting errors quickly.
+- **Threshold of 1** would be too aggressive — a single network hiccup or GC pause could cause a blip, and you'd unnecessarily pull a healthy instance.
+- **Threshold of 2** is the sweet spot: tolerates one transient failure but catches real outages within 2 check cycles.
+
+> **Notice the asymmetry**: Unhealthy threshold (2) < Healthy threshold (5). This is intentional! You want to **pull unhealthy instances out FAST** (2 checks = 60s) but **bring them back SLOWLY** (5 checks = 150s). It's the same philosophy as a circuit breaker: fail fast, recover cautiously.
+
+#### 8. Success Codes: `200`
+
+The HTTP status code(s) the ALB considers a "successful" health check response.
+
+| Setting | Meaning |
+|---------|---------|
+| `200` | ONLY 200 OK counts as healthy |
+| `200-299` | Any 2xx status code counts as healthy |
+| `200,301` | Either 200 or 301 counts as healthy |
+
+**Why just `200`?**
+- Our `/getTodos` endpoint returns `200` when everything is working
+- If it returns `500` (server error), `503` (unavailable), or `404` — that means something is wrong and the instance should be marked unhealthy
+- Being strict with `200` means any unexpected behavior is caught
+
+**When to use a range like `200-299`?**
+- If your health check endpoint might return `204 No Content` (valid but no body)
+- If your app uses various 2xx codes for success responses
+- Generally, keep it strict (`200`) unless you have a reason to broaden it
+
+#### Putting It All Together - The Full Health Check Lifecycle
+
+```
+═══════════════════════════════════════════════════════════════════════════
+ FULL LIFECYCLE: Instance Failure and Recovery
+ Settings: Interval=30s, Timeout=5s, Healthy=5, Unhealthy=2, Codes=200
+═══════════════════════════════════════════════════════════════════════════
+
+ PHASE 1: NORMAL OPERATION
+ ─────────────────────────
+   0:00  GET /getTodos → 200 ✓  (healthy, receiving traffic)
+   0:30  GET /getTodos → 200 ✓  (healthy, receiving traffic)
+   1:00  GET /getTodos → 200 ✓  (healthy, receiving traffic)
+
+ PHASE 2: APP CRASHES (someone did `pkill node`)
+ ────────────────────────────────────────────────
+   1:30  GET /getTodos → TIMEOUT after 5s ✗  (1/2 failures)
+         └─ Still marked healthy, still receiving traffic
+   2:00  GET /getTodos → TIMEOUT after 5s ✗  (2/2 failures)
+         └─ NOW UNHEALTHY! ALB stops sending traffic to this instance
+         └─ All traffic goes to the other healthy instance(s)
+
+ PHASE 3: APP RESTARTED (someone ran `node app.js` again)
+ ─────────────────────────────────────────────────────────
+   2:30  GET /getTodos → 200 ✓  (1/5 successes — still unhealthy)
+   3:00  GET /getTodos → 200 ✓  (2/5 successes — still unhealthy)
+   3:30  GET /getTodos → 200 ✓  (3/5 successes — still unhealthy)
+   4:00  GET /getTodos → 200 ✓  (4/5 successes — still unhealthy)
+   4:30  GET /getTodos → 200 ✓  (5/5 successes)
+         └─ NOW HEALTHY AGAIN! ALB resumes sending traffic
+
+ TIMELINE SUMMARY:
+   Failure detection:  ~60 seconds  (2 checks × 30s interval)
+   Recovery time:      ~150 seconds (5 checks × 30s interval)
+   Total downtime for this instance: ~3.5 minutes
+
+═══════════════════════════════════════════════════════════════════════════
+```
+
+> **Key Takeaway**: The ALB doesn't just blindly spray traffic — it continuously monitors every instance and only routes to healthy ones. If an instance dies, traffic shifts to survivors within ~60 seconds. When it comes back, the ALB cautiously waits ~150 seconds of consistent health before trusting it again. This is automatic — no human intervention needed.
+
+---
+
 ## VPC Setup: Create `my-vpc-1` (Prerequisite for All Tasks)
 
 > **Do this FIRST before anything else.** All 3 tasks run inside this VPC. If you already have `my-vpc-1` from a previous lab, skip to Pre-Setup.
